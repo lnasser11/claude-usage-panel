@@ -119,9 +119,15 @@ pub fn token_from_credentials_json(text: &str, now: DateTime<Utc>) -> Result<Tok
 
 /// One GET to the usage endpoint. Blocking; call from a worker thread.
 pub fn fetch(token: &Token, timeout: Duration) -> Result<LimitsReading, FetchError> {
+    // Windows certificate store via schannel; no bundled root list to go stale.
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
+        .tls_config(tls)
         .build()
         .new_agent();
     let resp = agent
