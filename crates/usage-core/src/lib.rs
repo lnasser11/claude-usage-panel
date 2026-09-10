@@ -11,6 +11,7 @@
 
 pub mod aggregate;
 pub mod discovery;
+pub mod limits;
 pub mod model;
 pub mod parse;
 pub mod pricing;
@@ -18,6 +19,7 @@ pub mod scanner;
 pub mod snapshot;
 pub mod store;
 
+pub use limits::{FetchError, LimitsReading, Token, TokenSource};
 pub use aggregate::{DayTotals, ModelTotals, SessionTotals, Totals};
 pub use model::{TokenUsage, UsageEvent};
 pub use pricing::PricingTable;

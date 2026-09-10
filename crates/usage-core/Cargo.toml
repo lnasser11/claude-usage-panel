@@ -9,6 +9,7 @@ description = "Reads Claude Code JSONL transcripts and aggregates token usage. N
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

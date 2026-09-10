@@ -1,0 +1,127 @@
+# Claude usage panel
+
+A hidden panel that slides down from the top-center of the laptop display when
+the mouse dwells there, showing how much of your Claude subscription limits is
+used and what Claude Code has consumed today. Windows 11, Rust, no runtime to
+install.
+
+**Costs shown anywhere in this project are estimates at Anthropic list price,
+computed from local token counts. They are not billing data.**
+
+## What it shows
+
+Collapsed face (a glance, not a dashboard):
+
+- **Session (5 h)** and **Weekly (7 d)** - percentage of the subscription window
+  used and when it resets. These are account-wide: the same windows claude.ai
+  chat, Cowork and Claude Code all draw from.
+- **Today** - tokens and estimated cost from Claude Code transcripts on this PC.
+  Chat and Cowork usage never appears here because it is not stored locally.
+- A footer saying how old the limit reading is. Stale readings are drawn grey;
+  a window whose reset time has passed shows "window reset - no newer reading"
+  instead of a number. The panel never displays a guessed percentage.
+
+Click the panel to expand: every other limit the account reports (Opus/Sonnet
+weekly, usage credits, spend limit), tokens and estimated cost per model, and
+the last 7 days. Click again to collapse. Right-click for Refresh / Open
+settings / Open log / Quit.
+
+## Where the data comes from
+
+| Data | Source | Notes |
+|---|---|---|
+| Limit windows | `GET https://api.anthropic.com/api/oauth/usage` with your OAuth token | **Unsupported.** This is the call Claude Code's own `/usage` makes; it is not publicly documented and may change without notice. The panel polls it at most once per `limits_min_gap_secs`. |
+| Token counts, per-model, per-day | `~/.claude/projects/**/*.jsonl` (Claude Code transcripts) | Read incrementally; only appended bytes are re-read. One API response is written as several records sharing `message.id`; the last one wins. |
+| Prices | `crates/usage-core/pricing.json` | Copied from the official pricing page on the date in the file. Update by hand when prices change. |
+
+### The OAuth token
+
+The panel never refreshes or writes tokens. It resolves one in this order:
+
+1. `oauth_token` in `settings.json` - recommended. Run `claude setup-token` in a
+   terminal, sign in, and paste the long-lived token it prints.
+2. The `CLAUDE_CODE_OAUTH_TOKEN` environment variable.
+3. Claude Code's own access token in `~/.claude/.credentials.json`, only while it
+   is unexpired. Claude Code rotates it about every 8 hours and only when a
+   terminal session runs, so on its own this goes stale.
+
+When no usable token exists the bars say "no data" and the footer says why.
+
+## Build and run
+
+Requires a Rust toolchain (`cargo`). No .NET, no WebView.
+
+```bash
+cargo build --release
+```
+
+```bash
+target\release\claude-usage-panel.exe
+```
+
+The executable starts hidden (no window, no taskbar button, not in Alt+Tab).
+`scripts\install.cmd` builds, copies the exe to
+`%LOCALAPPDATA%\Programs\ClaudeUsagePanel`, and starts it.
+
+Verify the core library without a window:
+
+```bash
+cargo test --workspace
+```
+
+```bash
+target\release\usage-cli.exe --days 7
+```
+
+```bash
+target\release\usage-cli.exe --limits --raw
+```
+
+## Configuration
+
+`%APPDATA%\claude-usage-panel\settings.json` is created on first run with
+defaults and can be hand-edited (restart the panel to apply):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `hot_zone_width_fraction` | 0.18 | Entry zone width as a fraction of the display width, centered |
+| `hot_zone_height_px` | 3 | Entry zone height (logical px) |
+| `exit_margin_fraction`, `exit_margin_px` | 0.06, 40 | How much larger the exit zone is than the entry zone |
+| `dwell_ms` | 200 | Hover time before showing |
+| `hide_delay_ms` | 450 | Time outside the exit zone before hiding |
+| `poll_ms` | 40 | Cursor polling period (`GetCursorPos`, no hooks) |
+| `animation_ms` | 180 | Slide duration |
+| `display` | `"internal"` | `internal` (laptop panel), `primary`, or a device name like `\\.\DISPLAY2` |
+| `rescan_visible_secs`, `rescan_hidden_secs` | 15, 300 | Transcript rescan period |
+| `limits_visible_secs`, `limits_hidden_secs`, `limits_min_gap_secs` | 60, 300, 60 | Limit endpoint polling |
+| `stale_after_secs` | 900 | Readings older than this are drawn as stale |
+| `oauth_token` | null | Long-lived token from `claude setup-token` |
+| `retain_days` | 60 | Ignore transcripts older than this |
+| `run_at_login` | false | Registers the exe in `HKCU\...\Run` on next start |
+| `panel_width_px` | 340 | Panel width (logical px) |
+
+The log is at `%APPDATA%\claude-usage-panel\panel.log`.
+
+## Behaviour notes
+
+- Per-monitor DPI aware (`PER_MONITOR_AWARE_V2`); the hot zone is computed in
+  physical pixels of the target display and recomputed when displays change.
+- The panel never takes focus (`WS_EX_NOACTIVATE`) and is topmost; it does not
+  show while a fullscreen app or presentation has focus, or while the left
+  mouse button is held (window drags, including Windows 11 snap layouts).
+- Idle cost is one `GetCursorPos` every `poll_ms`; nothing else runs until the
+  cursor is near the hot zone.
+- A statusline hook (`claude-usage-snapshot.exe`) is also included. It prints a
+  compact status in the Claude Code terminal and saves the documented
+  `rate_limits` from the statusline JSON to `~/.claude/usage-snapshot.json`.
+  The panel does not depend on it.
+
+## Layout
+
+```
+crates/usage-core     library: discovery, incremental scanner, dedupe, aggregation,
+                      pricing, limit endpoint client, snapshot reader. Tested; no UI.
+crates/panel          the Win32 hover panel (windows-rs, Direct2D)
+crates/usage-cli      prints usage from real transcripts; --limits probes the endpoint
+crates/snapshot-hook  Claude Code statusLine command
+```

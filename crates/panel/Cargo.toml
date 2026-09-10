@@ -1,0 +1,36 @@
+[package]
+name = "claude-usage-panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hidden top-center hover panel showing Claude usage and limit windows (Windows 11)"
+
+[[bin]]
+name = "claude-usage-panel"
+path = "src/main.rs"
+
+[dependencies]
+usage-core = { path = "../usage-core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Devices_Display",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Security",
+]

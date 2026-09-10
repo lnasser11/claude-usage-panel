@@ -40,6 +40,9 @@ fn main() {
         .and_then(|d| d.parse().ok())
         .unwrap_or(7);
     let json = args.iter().any(|a| a == "--json");
+    if args.iter().any(|a| a == "--limits") {
+        return limits_mode(args.iter().any(|a| a == "--raw"));
+    }
 
     let root = discovery::default_projects_dir().expect("home directory");
     let pricing = PricingTable::builtin();
@@ -156,4 +159,49 @@ fn main() {
         "Costs are estimates at Anthropic list price ({}, fetched {}). Not billing data.",
         pricing.source, pricing.fetched
     );
+}
+
+/// Fetch the account limit windows once (unsupported endpoint; see usage_core::limits).
+fn limits_mode(raw: bool) {
+    use std::time::Duration;
+    use usage_core::limits;
+    let creds = discovery::claude_config_dir().map(|d| d.join(".credentials.json"));
+    let token = match limits::resolve_token(None, creds.as_deref(), Utc::now()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("no usable token: {e}");
+            eprintln!("options: run `claude` in a terminal to refresh Claude Code's token, or set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)");
+            std::process::exit(2);
+        }
+    };
+    println!("token source: {:?}, expires: {}", token.source, token.expires_at.map(|e| e.with_timezone(&Local).to_string()).unwrap_or_else(|| "n/a".into()));
+    match limits::fetch(&token, Duration::from_secs(10)) {
+        Ok(r) => {
+            for (name, w) in [
+                ("five_hour", &r.five_hour),
+                ("seven_day", &r.seven_day),
+                ("seven_day_opus", &r.seven_day_opus),
+                ("seven_day_sonnet", &r.seven_day_sonnet),
+                ("seven_day_overage_included", &r.seven_day_overage_included),
+                ("overage", &r.overage),
+                ("spend_limit", &r.spend_limit),
+            ] {
+                match w {
+                    Some(w) => println!("{name:<28} {:6.1}%  resets {}", w.used_percentage, w.resets_at.map(|t| t.with_timezone(&Local).to_string()).unwrap_or_else(|| "?".into())),
+                    None => println!("{name:<28} absent"),
+                }
+            }
+            for (name, w) in &r.other {
+                println!("{name:<28} {:6.1}%  (unanticipated field)", w.used_percentage);
+            }
+            if raw {
+                println!("--- raw body ---
+{}", r.raw);
+            }
+        }
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }
