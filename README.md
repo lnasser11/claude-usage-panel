@@ -36,14 +36,29 @@ settings / Open log / Quit.
 
 ### The OAuth token
 
-The panel never refreshes or writes tokens. It resolves one in this order:
+The usage endpoint requires the `user:profile` scope. Tokens from
+`claude setup-token` do not have it (verified: HTTP 403), so the only usable
+token is Claude Code's own session token in `~/.claude/.credentials.json`.
+That token expires about every 8 hours, and Claude Code renews it only while a
+terminal session is making requests.
 
-1. `oauth_token` in `settings.json` - recommended. Run `claude setup-token` in a
-   terminal, sign in, and paste the long-lived token it prints.
-2. The `CLAUDE_CODE_OAUTH_TOKEN` environment variable.
-3. Claude Code's own access token in `~/.claude/.credentials.json`, only while it
-   is unexpired. Claude Code rotates it about every 8 hours and only when a
-   terminal session runs, so on its own this goes stale.
+To stay live without a terminal open, the panel renews it itself
+(`auto_refresh_token`, on by default): when the stored token has expired, it
+posts the refresh token to the token endpoint Claude Code uses, then writes the
+new pair back to the credentials file atomically, keeping every other field.
+This is the same thing the third-party tray apps do. Caveats:
+
+- Unsupported flow. The endpoint URL was read from the Claude Code binary; the
+  request shape and the client id (`oauth_client_id`) are what third-party tools
+  use and are confirmed only by the server accepting them.
+- If a renewal ever fails after the refresh token was rotated, the terminal
+  `claude` will ask you to `/login` once. The panel retries at most once per
+  `refresh_retry_secs` after a failure and never touches the file otherwise.
+- Set `auto_refresh_token` to false to disable it; the panel then goes stale
+  between terminal sessions and says so.
+
+`oauth_token` in settings and `CLAUDE_CODE_OAUTH_TOKEN` are still honoured first
+if you have a token with the right scope from somewhere else.
 
 When no usable token exists the bars say "no data" and the footer says why.
 
@@ -95,7 +110,10 @@ defaults and can be hand-edited (restart the panel to apply):
 | `rescan_visible_secs`, `rescan_hidden_secs` | 15, 300 | Transcript rescan period |
 | `limits_visible_secs`, `limits_hidden_secs`, `limits_min_gap_secs` | 60, 300, 60 | Limit endpoint polling |
 | `stale_after_secs` | 900 | Readings older than this are drawn as stale |
-| `oauth_token` | null | Long-lived token from `claude setup-token` |
+| `oauth_token` | null | Explicit token with the `user:profile` scope, if you have one |
+| `auto_refresh_token` | true | Renew Claude Code's stored token when expired (see above) |
+| `oauth_client_id` | Claude Code's public id | Client id sent with the refresh |
+| `refresh_retry_secs` | 3600 | Back-off after a failed refresh |
 | `retain_days` | 60 | Ignore transcripts older than this |
 | `run_at_login` | false | Registers the exe in `HKCU\...\Run` on next start |
 | `panel_width_px` | 340 | Panel width (logical px) |

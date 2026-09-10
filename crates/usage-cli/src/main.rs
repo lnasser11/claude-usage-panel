@@ -41,7 +41,7 @@ fn main() {
         .unwrap_or(7);
     let json = args.iter().any(|a| a == "--json");
     if args.iter().any(|a| a == "--limits") {
-        return limits_mode(args.iter().any(|a| a == "--raw"));
+        return limits_mode(args.iter().any(|a| a == "--raw"), !args.iter().any(|a| a == "--no-refresh"));
     }
 
     let root = discovery::default_projects_dir().expect("home directory");
@@ -162,21 +162,21 @@ fn main() {
 }
 
 /// Fetch the account limit windows once (unsupported endpoint; see usage_core::limits).
-fn limits_mode(raw: bool) {
+fn limits_mode(raw: bool, allow_refresh: bool) {
     use std::time::Duration;
     use usage_core::limits;
     let creds = discovery::claude_config_dir().map(|d| d.join(".credentials.json"));
-    let token = match limits::resolve_token(None, creds.as_deref(), Utc::now()) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("no usable token: {e}");
-            eprintln!("options: run `claude` in a terminal to refresh Claude Code's token, or set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`)");
-            std::process::exit(2);
-        }
-    };
-    println!("token source: {:?}, expires: {}", token.source, token.expires_at.map(|e| e.with_timezone(&Local).to_string()).unwrap_or_else(|| "n/a".into()));
-    match limits::fetch(&token, Duration::from_secs(10)) {
-        Ok(r) => {
+    let out = limits::get_reading(None, creds.as_deref(), limits::DEFAULT_CLIENT_ID, allow_refresh, Duration::from_secs(10));
+    match out.refreshed {
+        Some(true) => println!("stored token was expired: refreshed and written back"),
+        Some(false) => println!("stored token was expired: refresh FAILED"),
+        None => {}
+    }
+    if let Some(src) = &out.source {
+        println!("token source: {src:?}");
+    }
+    match (out.reading, out.error) {
+        (Some(r), _) => {
             for (name, w) in [
                 ("five_hour", &r.five_hour),
                 ("seven_day", &r.seven_day),
@@ -192,16 +192,44 @@ fn limits_mode(raw: bool) {
                 }
             }
             for (name, w) in &r.other {
-                println!("{name:<28} {:6.1}%  (unanticipated field)", w.used_percentage);
+                println!("{name:<28} {:6.1}%  (unlisted window)", w.used_percentage);
+            }
+            println!("--- limits array ---");
+            for l in &r.limits {
+                println!(
+                    "{:<14} {:<8} {:>5.1}%  {:<8} {}{}",
+                    l.kind,
+                    l.group,
+                    l.percent,
+                    l.severity,
+                    l.scope.as_deref().unwrap_or("-"),
+                    if l.is_active { "  (active)" } else { "" }
+                );
+            }
+            if let Some(c) = &r.credits {
+                println!(
+                    "--- usage credits (billed) --- enabled={} {} of {} ({:.1}%){}",
+                    c.enabled,
+                    c.money(c.used_minor),
+                    c.limit_minor.map(|l| c.money(l)).unwrap_or_else(|| "no limit".into()),
+                    c.percent,
+                    if c.limit_reached { "  LIMIT REACHED" } else { "" }
+                );
+            }
+            if !r.breakdown.is_empty() {
+                println!("--- weekly window by surface ---");
+                for b in &r.breakdown {
+                    println!("{:<14} {:>3.0}%", b.display_name, b.percent);
+                }
             }
             if raw {
-                println!("--- raw body ---
-{}", r.raw);
+                println!("--- raw body ---\n{}", r.raw);
             }
         }
-        Err(e) => {
+        (None, Some(e)) => {
             eprintln!("fetch failed: {e}");
             std::process::exit(1);
         }
+        (None, None) => std::process::exit(1),
     }
 }

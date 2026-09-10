@@ -6,11 +6,17 @@
 //! stop accepting third-party callers at any time. The docs do say it is rate
 //! limited, so callers must keep a minimum interval between requests.
 //!
-//! Response schema: field names `five_hour`, `seven_day`, `seven_day_opus`,
-//! `seven_day_sonnet`, `seven_day_overage_included`, `overage`, `spend_limit`,
-//! `utilization`, `resets_at` were seen in the binary. The parser below is
-//! deliberately lenient and keeps the raw body so the exact shape can be
-//! confirmed against a real response (see `usage-cli --limits --raw`).
+//! Response schema, confirmed against a real response on 2026-09-10:
+//! - `five_hour` / `seven_day` / `seven_day_opus` / `seven_day_sonnet` / …:
+//!   `{utilization: <percent 0-100>, resets_at: <RFC3339>, …}` or null;
+//! - `limits`: array of `{kind: session|weekly_all|weekly_scoped, group, percent,
+//!   severity, resets_at, scope: {model: {display_name}} | null, is_active}`;
+//! - `extra_usage`: usage credits `{is_enabled, monthly_limit, used_credits,
+//!   utilization, currency, decimal_places, spend_limit_reached}` (real billing);
+//! - `seven_day_breakdown.rows`: `{key, display_name, percent}` share of the
+//!   weekly window per surface (Claude Code, Chats, Cowork).
+//! Unknown code-named windows also appear; they are kept in `other` only.
+//! The parser stays lenient and keeps the raw body (`usage-cli --limits --raw`).
 //!
 //! Token policy: this module NEVER refreshes or writes OAuth tokens. It uses,
 //! in order: an explicit token, `CLAUDE_CODE_OAUTH_TOKEN`, or the access token
@@ -23,6 +29,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// OAuth token endpoint used by Claude Code (URL seen in the 2.1.260 binary).
+pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+/// Claude Code's public OAuth client id, as used by third-party usage tools.
+/// ASSUMPTION: recalled, not read from the binary (that extraction was blocked).
+/// A wrong id is simply rejected by the server, so it fails safe. Overridable.
+pub const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Claude Code sends this beta header with OAuth bearer tokens (seen in the binary).
 pub const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 
@@ -47,9 +59,59 @@ pub struct Window {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+/// One row of the `limits` array.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LimitEntry {
+    /// `session`, `weekly_all`, `weekly_scoped`, …
+    pub kind: String,
+    pub group: String,
+    pub percent: f64,
+    pub severity: String,
+    pub resets_at: Option<DateTime<Utc>>,
+    /// Model display name for scoped windows (e.g. "Fable").
+    pub scope: Option<String>,
+    pub is_active: bool,
+}
+
+/// Usage credits ("extra usage"): real money, not an estimate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Credits {
+    pub enabled: bool,
+    pub used_minor: i64,
+    pub limit_minor: Option<i64>,
+    pub currency: String,
+    pub exponent: u32,
+    pub percent: f64,
+    pub limit_reached: bool,
+}
+
+impl Credits {
+    pub fn money(&self, minor: i64) -> String {
+        let div = 10f64.powi(self.exponent as i32);
+        let sym = match self.currency.as_str() {
+            "BRL" => "R$",
+            "USD" => "$",
+            "EUR" => "€",
+            "GBP" => "£",
+            other => other,
+        };
+        format!("{sym}{:.*}", self.exponent as usize, minor as f64 / div)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BreakdownRow {
+    pub key: String,
+    pub display_name: String,
+    pub percent: f64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LimitsReading {
     pub fetched_at: DateTime<Utc>,
+    pub limits: Vec<LimitEntry>,
+    pub credits: Option<Credits>,
+    pub breakdown: Vec<BreakdownRow>,
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
     pub seven_day_opus: Option<Window>,
@@ -72,6 +134,8 @@ pub enum FetchError {
     Http(u16, String),
     Network(String),
     BadBody(String),
+    RefreshFailed(String),
+    NoRefreshToken,
 }
 
 impl std::fmt::Display for FetchError {
@@ -84,6 +148,8 @@ impl std::fmt::Display for FetchError {
             FetchError::Http(c, m) => write!(f, "HTTP {c}: {m}"),
             FetchError::Network(m) => write!(f, "network: {m}"),
             FetchError::BadBody(m) => write!(f, "unexpected response: {m}"),
+            FetchError::RefreshFailed(m) => write!(f, "token refresh failed: {m}"),
+            FetchError::NoRefreshToken => write!(f, "no refresh token in credentials file"),
         }
     }
 }
@@ -119,18 +185,7 @@ pub fn token_from_credentials_json(text: &str, now: DateTime<Utc>) -> Result<Tok
 
 /// One GET to the usage endpoint. Blocking; call from a worker thread.
 pub fn fetch(token: &Token, timeout: Duration) -> Result<LimitsReading, FetchError> {
-    // Windows certificate store via schannel; no bundled root list to go stale.
-    let tls = ureq::tls::TlsConfig::builder()
-        .provider(ureq::tls::TlsProvider::NativeTls)
-        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-        .build();
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .tls_config(tls)
-        .build()
-        .new_agent();
-    let resp = agent
+    let resp = agent(timeout)
         .get(USAGE_URL)
         .header("Authorization", &format!("Bearer {}", token.value))
         .header("anthropic-beta", OAUTH_BETA_HEADER)
@@ -151,6 +206,156 @@ pub fn fetch(token: &Token, timeout: Duration) -> Result<LimitsReading, FetchErr
     }
 }
 
+/// Windows certificate store via schannel; no bundled root list to go stale.
+fn agent(timeout: Duration) -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .tls_config(tls)
+        .build()
+        .new_agent()
+}
+
+/// Renew Claude Code's stored token pair using its refresh token, and write the
+/// result back to `path` atomically, preserving every other field in the file.
+///
+/// Request shape ASSUMED (not documented): JSON `{grant_type, refresh_token, client_id}`;
+/// response `{access_token, refresh_token?, expires_in}`. Tokens are never logged.
+pub fn refresh_credentials(path: &Path, client_id: &str, timeout: Duration) -> Result<Token, FetchError> {
+    let text = fs::read_to_string(path).map_err(|_| FetchError::NoToken)?;
+    let mut root: Value = serde_json::from_str(&text).map_err(|_| FetchError::NoToken)?;
+    let refresh_token = root["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or(FetchError::NoRefreshToken)?
+        .to_string();
+
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    })
+    .to_string();
+    let resp = agent(timeout)
+        .post(TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("User-Agent", "claude-usage-panel/0.1")
+        .send(body.as_bytes())
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    let status = resp.status().as_u16();
+    let text = resp
+        .into_body()
+        .read_to_string()
+        .map_err(|e| FetchError::Network(e.to_string()))?;
+    if status != 200 {
+        return Err(FetchError::RefreshFailed(format!("HTTP {status}: {}", short(&text))));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| FetchError::RefreshFailed(e.to_string()))?;
+    let access = v["access_token"]
+        .as_str()
+        .ok_or_else(|| FetchError::RefreshFailed("no access_token in response".into()))?
+        .to_string();
+    let expires_in = v["expires_in"].as_i64().unwrap_or(3600);
+    let expires_at = Utc::now() + chrono::Duration::seconds(expires_in);
+
+    let o = root["claudeAiOauth"]
+        .as_object_mut()
+        .ok_or_else(|| FetchError::RefreshFailed("claudeAiOauth missing".into()))?;
+    o.insert("accessToken".into(), Value::String(access.clone()));
+    if let Some(rt) = v["refresh_token"].as_str() {
+        o.insert("refreshToken".into(), Value::String(rt.to_string()));
+    }
+    o.insert("expiresAt".into(), Value::from(expires_at.timestamp_millis()));
+    if let Some(scope) = v["scope"].as_str() {
+        let scopes: Vec<Value> = scope.split_whitespace().map(|s| Value::String(s.to_string())).collect();
+        if !scopes.is_empty() {
+            o.insert("scopes".into(), Value::Array(scopes));
+        }
+    }
+
+    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string(&root).unwrap())
+        .and_then(|_| fs::rename(&tmp, path))
+        .map_err(|e| FetchError::RefreshFailed(format!("write-back failed: {e}")))?;
+
+    Ok(Token { value: access, source: TokenSource::CredentialsFile, expires_at: Some(expires_at) })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    pub reading: Option<LimitsReading>,
+    pub source: Option<TokenSource>,
+    /// A refresh was attempted this call and succeeded / failed.
+    pub refreshed: Option<bool>,
+    pub error: Option<FetchError>,
+}
+
+/// Resolve a token, fetch, and if the stored token is expired or rejected (and
+/// `allow_refresh`), renew it once and fetch again.
+pub fn get_reading(explicit: Option<&str>, credentials_path: Option<&Path>, client_id: &str, allow_refresh: bool, timeout: Duration) -> Outcome {
+    let mut out = Outcome::default();
+    let now = Utc::now();
+    let mut token = resolve_token(explicit, credentials_path, now);
+
+    let can_refresh = |t: &Result<Token, FetchError>| {
+        allow_refresh
+            && credentials_path.is_some()
+            && match t {
+                Err(FetchError::TokenExpired) => true,
+                Ok(t) => t.source == TokenSource::CredentialsFile,
+                _ => false,
+            }
+    };
+
+    if matches!(token, Err(FetchError::TokenExpired)) && can_refresh(&token) {
+        match refresh_credentials(credentials_path.unwrap(), client_id, timeout) {
+            Ok(t) => {
+                out.refreshed = Some(true);
+                token = Ok(t);
+            }
+            Err(e) => {
+                out.refreshed = Some(false);
+                out.error = Some(e);
+                return out;
+            }
+        }
+    }
+    let token = match token {
+        Ok(t) => t,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
+    out.source = Some(token.source.clone());
+
+    match fetch(&token, timeout) {
+        Ok(r) => out.reading = Some(r),
+        Err(e @ (FetchError::TokenExpired | FetchError::Unauthorized(_))) if out.refreshed.is_none() && can_refresh(&Ok(token.clone())) => {
+            match refresh_credentials(credentials_path.unwrap(), client_id, timeout) {
+                Ok(t) => {
+                    out.refreshed = Some(true);
+                    match fetch(&t, timeout) {
+                        Ok(r) => out.reading = Some(r),
+                        Err(e2) => out.error = Some(e2),
+                    }
+                }
+                Err(re) => {
+                    out.refreshed = Some(false);
+                    out.error = Some(FetchError::RefreshFailed(format!("{re} (after {e})")));
+                }
+            }
+        }
+        Err(e) => out.error = Some(e),
+    }
+    out
+}
+
 fn short(s: &str) -> String {
     s.chars().take(200).collect()
 }
@@ -161,6 +366,10 @@ pub fn parse_body(body: &str, fetched_at: DateTime<Utc>) -> Result<LimitsReading
     let obj = v.as_object().ok_or_else(|| FetchError::BadBody("top level is not an object".into()))?;
     let mut r = LimitsReading { fetched_at, raw: body.to_string(), ..Default::default() };
     for (k, val) in obj {
+        // Structured sections handled below; not windows.
+        if matches!(k.as_str(), "limits" | "extra_usage" | "spend" | "seven_day_breakdown") {
+            continue;
+        }
         let w = match parse_window(val) {
             Some(w) => w,
             None => continue,
@@ -176,7 +385,47 @@ pub fn parse_body(body: &str, fetched_at: DateTime<Utc>) -> Result<LimitsReading
             other => r.other.push((other.to_string(), w)),
         }
     }
-    if r.five_hour.is_none() && r.seven_day.is_none() && r.other.is_empty() {
+    if let Some(arr) = obj.get("limits").and_then(Value::as_array) {
+        for e in arr {
+            let (Some(kind), Some(percent)) = (e["kind"].as_str(), e["percent"].as_f64()) else { continue };
+            r.limits.push(LimitEntry {
+                kind: kind.to_string(),
+                group: e["group"].as_str().unwrap_or("").to_string(),
+                percent,
+                severity: e["severity"].as_str().unwrap_or("").to_string(),
+                resets_at: e.get("resets_at").and_then(parse_time),
+                scope: e["scope"]["model"]["display_name"].as_str().map(str::to_string),
+                is_active: e["is_active"].as_bool().unwrap_or(false),
+            });
+        }
+    }
+    if let Some(x) = obj.get("extra_usage").filter(|v| v.is_object()) {
+        if let Some(used) = x["used_credits"].as_f64() {
+            let exponent = x["decimal_places"].as_u64().unwrap_or(2) as u32;
+            r.credits = Some(Credits {
+                enabled: x["is_enabled"].as_bool().unwrap_or(false),
+                used_minor: used.round() as i64,
+                limit_minor: x["monthly_limit"].as_i64(),
+                currency: x["currency"].as_str().unwrap_or("").to_string(),
+                exponent,
+                percent: x["utilization"].as_f64().unwrap_or(0.0),
+                limit_reached: x["spend_limit_reached"].as_bool().unwrap_or(false),
+            });
+        }
+    }
+    // Note: indexing a serde_json Map with a missing key panics; use get().
+    if let Some(rows) = obj.get("seven_day_breakdown").and_then(|b| b["rows"].as_array()) {
+        for row in rows {
+            if let (Some(key), Some(pct)) = (row["key"].as_str(), row["percent"].as_f64()) {
+                r.breakdown.push(BreakdownRow {
+                    key: key.to_string(),
+                    display_name: row["display_name"].as_str().unwrap_or(key).to_string(),
+                    percent: pct,
+                });
+            }
+        }
+    }
+    if r.five_hour.is_none() && r.seven_day.is_none() && r.limits.is_empty() && r.other.is_empty() {
         return Err(FetchError::BadBody("no limit windows found".into()));
     }
     Ok(r)
@@ -184,15 +433,13 @@ pub fn parse_body(body: &str, fetched_at: DateTime<Utc>) -> Result<LimitsReading
 
 fn parse_window(v: &Value) -> Option<Window> {
     let o = v.as_object()?;
-    // `utilization` is a 0–1 fraction in Claude Code (it multiplies by 100);
-    // `percent` / `used_percentage` are already 0–100.
-    let used = if let Some(u) = o.get("utilization").and_then(Value::as_f64) {
-        u * 100.0
-    } else if let Some(p) = o.get("percent").or_else(|| o.get("used_percentage")).and_then(Value::as_f64) {
-        p
-    } else {
-        return None;
-    };
+    // Confirmed on a real response: `utilization` is already 0–100
+    // (e.g. 34.0 when claude.ai shows 34% used). So are `percent` / `used_percentage`.
+    let used = o
+        .get("utilization")
+        .or_else(|| o.get("percent"))
+        .or_else(|| o.get("used_percentage"))
+        .and_then(Value::as_f64)?;
     let resets_at = o.get("resets_at").and_then(parse_time);
     Some(Window { used_percentage: used, resets_at })
 }
@@ -231,8 +478,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_fraction_utilization_and_epoch_seconds() {
-        let body = r#"{"five_hour":{"utilization":0.235,"resets_at":1789002600},"seven_day":{"utilization":0.412,"resets_at":"2026-09-16T12:00:00Z"},"seven_day_opus":null,"extra_window":{"utilization":0.5,"resets_at":1789002600},"not_a_window":"x"}"#;
+    fn parses_percent_utilization_and_epoch_seconds() {
+        let body = r#"{"five_hour":{"utilization":23.5,"resets_at":1789002600},"seven_day":{"utilization":41.2,"resets_at":"2026-09-16T12:00:00Z"},"seven_day_opus":null,"extra_window":{"utilization":50,"resets_at":1789002600},"not_a_window":"x"}"#;
         let r = parse_body(body, Utc::now()).unwrap();
         let fh = r.five_hour.unwrap();
         assert!((fh.used_percentage - 23.5).abs() < 1e-9);
@@ -245,8 +492,36 @@ mod tests {
         assert_eq!(r.other[0].0, "extra_window");
     }
 
+    /// Trimmed copy of a real response (2026-09-10, Max 5x plan).
+    const REAL: &str = r#"{"five_hour":{"utilization":34.0,"resets_at":"2026-09-10T17:20:00.239284+00:00","limit_dollars":null,"locked_reason":null},"seven_day":{"utilization":11.0,"resets_at":"2026-09-16T08:00:00.239305+00:00"},"seven_day_opus":null,"seven_day_sonnet":null,"nimbus_quill":{"utilization":0.0,"resets_at":null},"extra_usage":{"is_enabled":true,"monthly_limit":11000,"used_credits":9503.0,"utilization":86.39090909090909,"currency":"BRL","decimal_places":2,"disabled_reason":null,"user_disabled":false,"spend_limit_reached":false},"limits":[{"kind":"session","group":"session","percent":34,"severity":"normal","resets_at":"2026-09-10T17:20:00.239284+00:00","scope":null,"is_active":true},{"kind":"weekly_all","group":"weekly","percent":11,"severity":"normal","resets_at":"2026-09-16T08:00:00.239305+00:00","scope":null,"is_active":false},{"kind":"weekly_scoped","group":"weekly","percent":20,"severity":"normal","resets_at":"2026-09-16T08:00:00.239561+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}],"seven_day_breakdown":{"as_of":"2026-09-10T13:23:30.319105+00:00","rows":[{"key":"claude_code","display_name":"Claude Code","percent":53},{"key":"chat","display_name":"Chats","percent":9},{"key":"cowork","display_name":"Cowork","percent":38},{"key":"other","display_name":"Other","percent":0}]}}"#;
+
     #[test]
-    fn parses_percent_form_and_millis() {
+    fn parses_real_response_shape() {
+        let r = parse_body(REAL, Utc::now()).unwrap();
+        assert_eq!(r.five_hour.unwrap().used_percentage, 34.0);
+        let sd = r.seven_day.unwrap();
+        assert_eq!(sd.used_percentage, 11.0);
+        assert_eq!(sd.resets_at.unwrap().to_rfc3339(), "2026-09-16T08:00:00.239305+00:00");
+        assert_eq!(r.limits.len(), 3);
+        let scoped = r.limits.iter().find(|l| l.kind == "weekly_scoped").unwrap();
+        assert_eq!(scoped.percent, 20.0);
+        assert_eq!(scoped.scope.as_deref(), Some("Fable"));
+        assert!(r.limits.iter().find(|l| l.kind == "session").unwrap().is_active);
+        let c = r.credits.unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.used_minor, 9503);
+        assert_eq!(c.limit_minor, Some(11000));
+        assert_eq!(c.money(c.used_minor), "R$95.03");
+        assert_eq!(c.money(c.limit_minor.unwrap()), "R$110.00");
+        assert!((c.percent - 86.39).abs() < 0.01);
+        assert_eq!(r.breakdown.len(), 4);
+        assert_eq!(r.breakdown[0].display_name, "Claude Code");
+        assert_eq!(r.breakdown[0].percent, 53.0);
+        assert_eq!(r.other.len(), 1, "code-named window kept only in `other`");
+    }
+
+    #[test]
+    fn parses_used_percentage_form_and_millis() {
         let body = r#"{"five_hour":{"used_percentage":50,"resets_at":1789002600000}}"#;
         let r = parse_body(body, Utc::now()).unwrap();
         let fh = r.five_hour.unwrap();

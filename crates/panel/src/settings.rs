@@ -38,6 +38,13 @@ pub struct Settings {
     /// Long-lived OAuth token from `claude setup-token`. Leave null to fall back to
     /// CLAUDE_CODE_OAUTH_TOKEN, then to Claude Code's stored access token.
     pub oauth_token: Option<String>,
+    /// Renew Claude Code's stored token with its refresh token when it has expired
+    /// (writes ~/.claude/.credentials.json). Unsupported flow; see README.
+    pub auto_refresh_token: bool,
+    /// OAuth client id used for the refresh. Default is Claude Code's public id.
+    pub oauth_client_id: String,
+    /// After a failed refresh, wait this long before trying again.
+    pub refresh_retry_secs: u64,
     /// Only look at transcripts modified in the last N days.
     pub retain_days: i64,
     /// Register in HKCU\...\Run so the panel starts at login.
@@ -65,6 +72,9 @@ impl Default for Settings {
             limits_min_gap_secs: 60,
             stale_after_secs: 900,
             oauth_token: None,
+            auto_refresh_token: true,
+            oauth_client_id: usage_core::limits::DEFAULT_CLIENT_ID.to_string(),
+            refresh_retry_secs: 3600,
             retain_days: 60,
             run_at_login: false,
             panel_width_px: 340,

@@ -136,25 +136,40 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
     let age = limits.last_success.map(|t| now_i.duration_since(t));
     let r = limits.reading.as_ref();
 
+    let stale = age.map_or(true, |a| a > stale_after);
     let mut bars = vec![
         bar("Session (5 h)", r.and_then(|r| r.five_hour.as_ref()), age, stale_after, now, true),
         bar("Weekly (7 d)", r.and_then(|r| r.seven_day.as_ref()), age, stale_after, now, false),
     ];
-    if expanded {
-        if let Some(r) = r {
+    if let Some(r) = r {
+        // Per-model weekly windows from the `limits` array (e.g. "Fable").
+        for l in r.limits.iter().filter(|l| l.kind == "weekly_scoped") {
+            let label = format!("Weekly {}", l.scope.as_deref().unwrap_or("model"));
+            let w = Window { used_percentage: l.percent, resets_at: l.resets_at };
+            bars.push(bar(&label, Some(&w), age, stale_after, now, false));
+        }
+        // Usage credits are real money, so they earn a place on the collapsed face.
+        if let Some(c) = r.credits.as_ref().filter(|c| c.enabled) {
+            let right = match c.limit_minor {
+                Some(lim) => format!("{} of {} this month", c.money(c.used_minor), c.money(lim)),
+                None => format!("{} this month", c.money(c.used_minor)),
+            };
+            bars.push(BarRow {
+                label: "Usage credits (billed)".into(),
+                right,
+                pct: Some(c.percent.clamp(0.0, 100.0)),
+                state: if stale { BarState::Stale } else { BarState::Fresh },
+            });
+        }
+        if expanded {
             for (label, w) in [
                 ("Weekly Opus", r.seven_day_opus.as_ref()),
                 ("Weekly Sonnet", r.seven_day_sonnet.as_ref()),
                 ("Weekly (credits incl.)", r.seven_day_overage_included.as_ref()),
-                ("Usage credits", r.overage.as_ref()),
-                ("Spend limit", r.spend_limit.as_ref()),
             ] {
                 if w.is_some() {
                     bars.push(bar(label, w, age, stale_after, now, false));
                 }
-            }
-            for (name, w) in &r.other {
-                bars.push(bar(name, Some(w), age, stale_after, now, false));
             }
         }
     }
@@ -177,6 +192,14 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
 
     let mut detail = Vec::new();
     if expanded {
+        if let Some(r) = r {
+            if !r.breakdown.is_empty() {
+                detail.push((String::new(), "Weekly window by surface".into()));
+                for b in r.breakdown.iter().filter(|b| b.percent > 0.0) {
+                    detail.push((b.display_name.clone(), format!("{:.0}% of this week's use", b.percent)));
+                }
+            }
+        }
         if !scan.by_model.is_empty() {
             detail.push((String::new(), "By model - last 7 days".into()));
             for m in scan.by_model.iter().take(5) {

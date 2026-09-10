@@ -35,6 +35,7 @@ pub struct LimitsView {
     pub error: Option<String>,
     pub token_source: Option<String>,
     pub fetching: bool,
+    pub last_refresh_failure: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -197,11 +198,13 @@ fn publish_scan(shared: &Shared, scanner: &Scanner, pricing: &PricingTable, load
 }
 
 fn fetch_limits(settings: &Settings, shared: &Shared) {
-    {
+    let allow_refresh = {
         let mut l = shared.limits.lock().unwrap();
         l.fetching = true;
         l.last_attempt = Some(Instant::now());
-    }
+        settings.auto_refresh_token
+            && l.last_refresh_failure.map_or(true, |t| t.elapsed() >= Duration::from_secs(settings.refresh_retry_secs))
+    };
     let creds = discovery::claude_config_dir().map(|d| d.join(".credentials.json"));
     // Re-read the token from settings.json each time so pasting one takes effect
     // without restarting the panel.
@@ -210,23 +213,36 @@ fn fetch_limits(settings: &Settings, shared: &Shared) {
         .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
         .and_then(|s| s.oauth_token)
         .or_else(|| settings.oauth_token.clone());
-    let token = limits::resolve_token(explicit.as_deref(), creds.as_deref(), Utc::now());
-    let result = token.and_then(|t| {
-        let src = format!("{:?}", t.source);
-        limits::fetch(&t, Duration::from_secs(8)).map(|r| (r, src))
-    });
+    let out = limits::get_reading(
+        explicit.as_deref(),
+        creds.as_deref(),
+        &settings.oauth_client_id,
+        allow_refresh,
+        Duration::from_secs(8),
+    );
+    match out.refreshed {
+        Some(true) => log("token refreshed and written back to credentials file"),
+        Some(false) => log("token refresh failed; will retry after the configured delay"),
+        None => {}
+    }
     let mut l = shared.limits.lock().unwrap();
     l.fetching = false;
-    match result {
-        Ok((reading, src)) => {
+    if out.refreshed == Some(false) {
+        l.last_refresh_failure = Some(Instant::now());
+    }
+    if let Some(src) = out.source {
+        l.token_source = Some(format!("{src:?}"));
+    }
+    match (out.reading, out.error) {
+        (Some(reading), _) => {
             l.reading = Some(reading);
             l.last_success = Some(Instant::now());
             l.error = None;
-            l.token_source = Some(src);
         }
-        Err(e) => {
+        (None, Some(e)) => {
             log(&format!("limits fetch failed: {e}"));
             l.error = Some(e.to_string());
         }
+        (None, None) => l.error = Some("no reading".into()),
     }
 }
