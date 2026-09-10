@@ -6,7 +6,18 @@ used and what Claude Code has consumed today. Windows 11, Rust, no runtime to
 install.
 
 **Costs shown anywhere in this project are estimates at Anthropic list price,
-computed from local token counts. They are not billing data.**
+computed from local token counts. They are not billing data.** The one
+exception is the "Usage credits (billed)" row, which the account reports
+directly.
+
+<p align="center">
+  <img src="docs/panel-collapsed.png" width="340" alt="Collapsed panel: session and weekly windows, per-model window, usage credits, today's tokens">
+  &nbsp;&nbsp;
+  <img src="docs/panel-expanded.png" width="340" alt="Expanded panel: weekly window by surface, per-model tokens, last 7 days">
+</p>
+
+Left: the face that slides down on hover. Right: after a click. The panel is
+slightly translucent, which is why the desktop shows through.
 
 ## What it shows
 
