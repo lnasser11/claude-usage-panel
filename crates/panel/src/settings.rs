@@ -51,6 +51,15 @@ pub struct Settings {
     pub run_at_login: bool,
     /// Panel width in logical pixels.
     pub panel_width_px: u32,
+    /// Panel background opacity, 0.5–1.0.
+    pub opacity: f64,
+    /// Sections of the face. The session and weekly bars are always shown.
+    pub show_credits: bool,
+    pub show_model_windows: bool,
+    pub show_today: bool,
+    pub show_breakdown: bool,
+    pub show_by_model: bool,
+    pub show_daily: bool,
 }
 
 impl Default for Settings {
@@ -78,8 +87,47 @@ impl Default for Settings {
             retain_days: 60,
             run_at_login: false,
             panel_width_px: 340,
+            opacity: 0.97,
+            show_credits: true,
+            show_model_windows: true,
+            show_today: true,
+            show_breakdown: true,
+            show_by_model: true,
+            show_daily: true,
         }
     }
+}
+
+impl Settings {
+    /// Clamp values a hand-edited file could push out of range.
+    pub fn sanitized(mut self) -> Self {
+        self.opacity = self.opacity.clamp(0.3, 1.0);
+        self.hot_zone_width_fraction = self.hot_zone_width_fraction.clamp(0.02, 1.0);
+        self.exit_margin_fraction = self.exit_margin_fraction.clamp(0.0, 0.5);
+        self.poll_ms = self.poll_ms.clamp(15, 500);
+        self.panel_width_px = self.panel_width_px.clamp(200, 900);
+        self.animation_ms = self.animation_ms.min(2000);
+        self
+    }
+}
+
+/// Parse the settings file; `None` if it is missing or invalid.
+pub fn load() -> Option<Settings> {
+    let text = fs::read_to_string(settings_path()).ok()?;
+    serde_json::from_str::<Settings>(&text).ok().map(Settings::sanitized)
+}
+
+/// Write the settings file atomically (pretty JSON, hand-editable).
+pub fn save(s: &Settings) -> std::io::Result<()> {
+    let path = settings_path();
+    fs::create_dir_all(config_dir())?;
+    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(s).unwrap())?;
+    fs::rename(&tmp, &path)
+}
+
+pub fn file_mtime() -> Option<std::time::SystemTime> {
+    fs::metadata(settings_path()).ok()?.modified().ok()
 }
 
 pub fn config_dir() -> PathBuf {
@@ -103,7 +151,7 @@ pub fn load_or_create() -> (Settings, Option<String>) {
     let path = settings_path();
     match fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<Settings>(&text) {
-            Ok(s) => (s, None),
+            Ok(s) => (s.sanitized(), None),
             Err(e) => (Settings::default(), Some(format!("settings.json invalid ({e}); using defaults"))),
         },
         Err(_) => {

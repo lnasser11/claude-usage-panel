@@ -2,7 +2,7 @@
 
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use chrono::Utc;
@@ -16,36 +16,56 @@ use windows::{
             Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
             Shell::{SHQueryUserNotificationState, ShellExecuteW, QUNS_APP, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN},
             WindowsAndMessaging::{
-                UpdateLayeredWindow, ULW_ALPHA, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
+                AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos,
                 GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
                 SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage,
-                CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MF_STRING,
-                MSG, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON, SW_SHOWNORMAL,
-                WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_NCCREATE, WM_RBUTTONUP,
-                WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+                UpdateLayeredWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HMENU, HWND_TOPMOST, IDC_ARROW,
+                MA_NOACTIVATE, MF_STRING, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
+                TPM_RETURNCMD, TPM_RIGHTBUTTON, ULW_ALPHA, WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
+                WM_MOUSEACTIVATE, WM_NCCREATE, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+                WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
             },
         },
     },
 };
 
 use crate::{
+    autostart,
     data::{self, Notifier, Shared},
     monitors::{self, Monitor},
     render::{Frame, Renderer},
-    settings::{log, settings_path, log_path, Settings},
+    settings::{self, log, log_path, settings_path, Settings},
+    settings_ui,
     tracker::{Action, Input, Rect, Tracker},
     view::{self, ViewModel},
 };
 
 const WM_APP_DATA: u32 = WM_APP + 1;
+/// Sent by a second `--settings` launch to the running instance.
+const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 2;
+const CLASS_NAME: PCWSTR = w!("ClaudeUsagePanelWindow");
+
+/// From a second process: find the running panel and ask it to open settings.
+pub fn ask_running_instance_for_settings() {
+    unsafe {
+        match windows::Win32::UI::WindowsAndMessaging::FindWindowW(CLASS_NAME, None) {
+            Ok(h) => {
+                let r = PostMessageW(Some(h), WM_APP_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                log(&format!("--settings: asked running instance ({:?})", r.is_ok()));
+            }
+            Err(e) => log(&format!("--settings: running instance window not found: {e}")),
+        }
+    }
+}
 const TIMER_POLL: usize = 1;
 const TIMER_ANIM: usize = 2;
 const TIMER_CLOCK: usize = 3;
 const MENU_REFRESH: usize = 1;
 const MENU_EXPAND: usize = 2;
-const MENU_SETTINGS: usize = 3;
+const MENU_SETTINGS_FILE: usize = 3;
 const MENU_LOG: usize = 4;
 const MENU_QUIT: usize = 5;
+const MENU_SETTINGS: usize = 6;
 
 struct PostNotifier(isize);
 impl Notifier for PostNotifier {
@@ -112,6 +132,9 @@ struct Anim {
 pub struct App {
     hwnd: HWND,
     settings: Settings,
+    settings_version: u64,
+    settings_mtime: Option<SystemTime>,
+    last_settings_check: Instant,
     shared: Arc<Shared>,
     tracker: Tracker,
     geo: Option<Geometry>,
@@ -139,8 +162,7 @@ impl App {
                 Some(mon) => {
                     let vm = self.vm.get_or_insert_with(|| ViewModel {
                         bars: vec![],
-                        today: String::new(),
-                        today_sub: String::new(),
+                        today: None,
                         footer: String::new(),
                         footer_warn: false,
                         detail: vec![],
@@ -191,7 +213,57 @@ impl App {
         Some(Rect { left: g.x + g.margin, top: self.cur_y.max(g.mon.bounds.top), right: g.x + g.margin + g.panel_w, bottom: self.cur_y + g.panel_h })
     }
 
+    /// Pick up settings changed by the settings page or by hand-editing the file.
+    fn check_settings(&mut self) {
+        let mtime = settings::file_mtime();
+        if mtime != self.settings_mtime {
+            self.settings_mtime = mtime;
+            if let Some(s) = settings::load() {
+                if s != self.shared.settings() {
+                    self.shared.update_settings(s);
+                }
+            }
+        }
+        let v = self.shared.settings_version();
+        if v != self.settings_version {
+            self.settings_version = v;
+            let s = self.shared.settings();
+            self.apply_settings(s);
+        }
+    }
+
+    fn apply_settings(&mut self, s: Settings) {
+        let poll_changed = s.poll_ms != self.settings.poll_ms;
+        if s.run_at_login != self.settings.run_at_login {
+            if let Err(e) = autostart::apply(s.run_at_login) {
+                log(&format!("run-at-login: {e}"));
+            }
+        }
+        self.tracker.dwell = Duration::from_millis(s.dwell_ms);
+        self.tracker.hide_delay = Duration::from_millis(s.hide_delay_ms);
+        self.settings = s;
+        self.geo = None;
+        self.frame = None;
+        self.vm = None;
+        if poll_changed {
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_POLL, self.settings.poll_ms.max(15) as u32, None);
+            }
+        }
+        if self.shown {
+            self.ensure_geometry();
+            if let Err(e) = self.render() {
+                log(&format!("render failed: {e}"));
+            }
+        }
+        log("settings applied");
+    }
+
     fn poll(&mut self) {
+        if self.last_settings_check.elapsed() >= Duration::from_secs(2) {
+            self.last_settings_check = Instant::now();
+            self.check_settings();
+        }
         let mut pt = POINT::default();
         if unsafe { GetCursorPos(&mut pt) }.is_err() {
             return;
@@ -227,7 +299,6 @@ impl App {
                 if self.tracker.is_visible() && self.shown && target == Some(g.hidden_y) {
                     self.start_show();
                 } else if !self.tracker.is_visible() && self.shown && target != Some(g.hidden_y) && self.anim.is_none() && self.cur_y == g.shown_y {
-                    // Tracker went Hidden without an explicit Hide (e.g. reset): hide.
                     self.start_hide();
                 }
             }
@@ -254,7 +325,7 @@ impl App {
             self.frame = Some(Frame::new(g.win_w, g.win_h)?);
         }
         let frame = self.frame.as_ref().unwrap();
-        self.renderer.as_mut().unwrap().draw(frame, g.scale, g.margin, g.panel_w, g.panel_h, &vm)?;
+        self.renderer.as_mut().unwrap().draw(frame, g.scale, g.margin, g.panel_w, g.panel_h, self.settings.opacity as f32, &vm)?;
         let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
         let dst = POINT { x: g.x, y: self.cur_y };
         let size = SIZE { cx: g.win_w, cy: g.win_h };
@@ -319,7 +390,7 @@ impl App {
                 return;
             }
         };
-        let t = (a.start.elapsed().as_secs_f32() / a.dur.as_secs_f32()).clamp(0.0, 1.0);
+        let t = if a.dur.is_zero() { 1.0 } else { (a.start.elapsed().as_secs_f32() / a.dur.as_secs_f32()).clamp(0.0, 1.0) };
         let eased = 1.0 - (1.0 - t).powi(3);
         let y = a.from + ((a.to - a.from) as f32 * eased).round() as i32;
         let to = a.to;
@@ -393,7 +464,8 @@ impl App {
             };
             let _ = AppendMenuW(menu, MF_STRING, MENU_REFRESH, w!("Refresh now"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXPAND, if self.expanded { w!("Collapse") } else { w!("Expand") });
-            let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Open settings.json"));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("Settings..."));
+            let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS_FILE, w!("Open settings.json"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_LOG, w!("Open log"));
             let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT, w!("Quit"));
             let _ = SetForegroundWindow(self.hwnd);
@@ -402,7 +474,11 @@ impl App {
             match cmd {
                 MENU_REFRESH => self.shared.refresh_now(),
                 MENU_EXPAND => self.toggle_expanded(),
-                MENU_SETTINGS => open_path(&settings_path().to_string_lossy()),
+                MENU_SETTINGS => {
+                    self.hide_now();
+                    settings_ui::open(self.shared.clone());
+                }
+                MENU_SETTINGS_FILE => open_path(&settings_path().to_string_lossy()),
                 MENU_LOG => open_path(&log_path().to_string_lossy()),
                 MENU_QUIT => {
                     self.shared.quit();
@@ -468,6 +544,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_APP_OPEN_SETTINGS => {
+            log("open settings requested");
+            if let Some(app) = app_from(hwnd) {
+                app.hide_now();
+                settings_ui::open(app.shared.clone());
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             if let Some(app) = app_from(hwnd) {
                 app.toggle_expanded();
@@ -494,10 +578,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     }
 }
 
-pub fn run(settings: Settings) -> Result<()> {
+pub fn run(settings: Settings, open_settings: bool) -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
-        let class_name = w!("ClaudeUsagePanelWindow");
+        let class_name = CLASS_NAME;
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
@@ -508,10 +592,13 @@ pub fn run(settings: Settings) -> Result<()> {
         };
         RegisterClassW(&wc);
 
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new(settings.clone()));
         let mut app = Box::new(App {
             hwnd: HWND::default(),
             tracker: Tracker::new(Duration::from_millis(settings.dwell_ms), Duration::from_millis(settings.hide_delay_ms)),
+            settings_version: shared.settings_version(),
+            settings_mtime: settings::file_mtime(),
+            last_settings_check: Instant::now(),
             settings: settings.clone(),
             shared: shared.clone(),
             geo: None,
@@ -542,9 +629,12 @@ pub fn run(settings: Settings) -> Result<()> {
         )?;
         app.hwnd = hwnd;
 
-        data::spawn(settings.clone(), shared.clone(), Box::new(PostNotifier(hwnd.0 as isize)));
+        data::spawn(shared.clone(), Box::new(PostNotifier(hwnd.0 as isize)));
         SetTimer(Some(hwnd), TIMER_POLL, settings.poll_ms.max(15) as u32, None);
         log("panel started");
+        if open_settings {
+            let _ = PostMessageW(Some(hwnd), WM_APP_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {

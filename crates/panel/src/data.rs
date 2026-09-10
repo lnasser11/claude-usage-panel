@@ -1,10 +1,12 @@
 //! Background data thread: transcript scanning and limit fetching.
 //!
 //! The UI thread never blocks on I/O. It reads `Shared` under a short lock and
-//! is told about updates via `PostMessageW(WM_APP_DATA)`.
+//! is told about updates via `PostMessageW(WM_APP_DATA)`. `Shared` also holds
+//! the live settings: the window and the settings page update them, the data
+//! thread reads them on every loop.
 
 use std::{
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -38,10 +40,10 @@ pub struct LimitsView {
     pub last_refresh_failure: Option<Instant>,
 }
 
-#[derive(Default)]
 pub struct Shared {
     pub scan: Mutex<ScanView>,
     pub limits: Mutex<LimitsView>,
+    settings: RwLock<(u64, Settings)>,
     wake: Mutex<WakeState>,
     cv: Condvar,
 }
@@ -54,6 +56,33 @@ struct WakeState {
 }
 
 impl Shared {
+    pub fn new(settings: Settings) -> Self {
+        Shared {
+            scan: Mutex::new(ScanView::default()),
+            limits: Mutex::new(LimitsView::default()),
+            settings: RwLock::new((0, settings)),
+            wake: Mutex::new(WakeState::default()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.settings.read().unwrap().1.clone()
+    }
+
+    pub fn settings_version(&self) -> u64 {
+        self.settings.read().unwrap().0
+    }
+
+    /// Replace the live settings; bumps the version so the window applies them.
+    pub fn update_settings(&self, s: Settings) {
+        let mut g = self.settings.write().unwrap();
+        g.0 += 1;
+        g.1 = s;
+        drop(g);
+        self.cv.notify_all();
+    }
+
     pub fn set_visible(&self, visible: bool) {
         let mut w = self.wake.lock().unwrap();
         if w.visible != visible {
@@ -82,17 +111,17 @@ pub trait Notifier: Send + 'static {
     fn notify(&self);
 }
 
-pub fn spawn(settings: Settings, shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
+pub fn spawn(shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
     thread::Builder::new()
         .name("data".into())
-        .spawn(move || run(settings, shared, notifier))
+        .spawn(move || run(shared, notifier))
         .expect("spawn data thread");
 }
 
-fn run(settings: Settings, shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
+fn run(shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
     let pricing = PricingTable::builtin();
     let root = discovery::default_projects_dir().unwrap_or_default();
-    let mut scanner = Scanner::new(&root).with_retention_days(settings.retain_days);
+    let mut scanner = Scanner::new(&root).with_retention_days(shared.settings().retain_days);
 
     {
         let mut s = shared.scan.lock().unwrap();
@@ -126,7 +155,7 @@ fn run(settings: Settings, shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
 
     let mut last_limits_attempt: Option<Instant> = None;
     loop {
-        // Fetch limits if due.
+        let settings = shared.settings();
         let visible = shared.wake.lock().unwrap().visible;
         let limits_period = Duration::from_secs(if visible { settings.limits_visible_secs } else { settings.limits_hidden_secs });
         let min_gap = Duration::from_secs(settings.limits_min_gap_secs);
@@ -166,14 +195,12 @@ fn run(settings: Settings, shared: Arc<Shared>, notifier: Box<dyn Notifier>) {
                 notifier.notify();
             }
         }
-        if forced {
+        if forced && last_limits_attempt.map_or(true, |t| t.elapsed() >= min_gap) {
             // A forced refresh (panel just opened) may fetch limits early, but never
             // more often than the minimum gap.
-            if last_limits_attempt.map_or(true, |t| t.elapsed() >= min_gap) {
-                last_limits_attempt = Some(Instant::now());
-                fetch_limits(&settings, &shared);
-                notifier.notify();
-            }
+            last_limits_attempt = Some(Instant::now());
+            fetch_limits(&settings, &shared);
+            notifier.notify();
         }
     }
 }
@@ -206,15 +233,8 @@ fn fetch_limits(settings: &Settings, shared: &Shared) {
             && l.last_refresh_failure.map_or(true, |t| t.elapsed() >= Duration::from_secs(settings.refresh_retry_secs))
     };
     let creds = discovery::claude_config_dir().map(|d| d.join(".credentials.json"));
-    // Re-read the token from settings.json each time so pasting one takes effect
-    // without restarting the panel.
-    let explicit = std::fs::read_to_string(crate::settings::settings_path())
-        .ok()
-        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
-        .and_then(|s| s.oauth_token)
-        .or_else(|| settings.oauth_token.clone());
     let out = limits::get_reading(
-        explicit.as_deref(),
+        settings.oauth_token.as_deref(),
         creds.as_deref(),
         &settings.oauth_client_id,
         allow_refresh,

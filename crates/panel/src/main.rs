@@ -6,6 +6,7 @@ mod data;
 mod monitors;
 mod render;
 mod settings;
+mod settings_ui;
 mod tracker;
 mod view;
 mod window;
@@ -15,16 +16,28 @@ use windows::{
     Win32::{
         Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
         System::Threading::CreateMutexW,
-        UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
+        UI::{
+            Controls::{InitCommonControlsEx, ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX},
+            HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
+        },
     },
 };
 
 fn main() {
     unsafe {
+        // The embedded manifest already declares per-monitor-v2 awareness; this is a
+        // harmless belt-and-braces call for builds without it.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        // Single instance.
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+        let _ = InitCommonControlsEx(&icc);
+        let want_settings = std::env::args().any(|a| a == "--settings");
+        // Single instance. A second launch with --settings asks the running one
+        // to open its settings page instead.
         let _mutex = CreateMutexW(None, false, w!("Local\\ClaudeUsagePanel"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            if want_settings {
+                window::ask_running_instance_for_settings();
+            }
             return;
         }
     }
@@ -35,7 +48,8 @@ fn main() {
     if let Err(e) = autostart::apply(settings.run_at_login) {
         settings::log(&format!("run-at-login: {e}"));
     }
-    if let Err(e) = window::run(settings) {
+    let open_settings = std::env::args().any(|a| a == "--settings");
+    if let Err(e) = window::run(settings, open_settings) {
         settings::log(&format!("fatal: {e}"));
     }
 }

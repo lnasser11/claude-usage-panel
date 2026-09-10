@@ -105,8 +105,18 @@ target\release\usage-cli.exe --limits --raw
 
 ## Configuration
 
-`%APPDATA%\claude-usage-panel\settings.json` is created on first run with
-defaults and can be hand-edited (restart the panel to apply):
+Right-click the panel and choose **Settings...** (or run
+`claude-usage-panel.exe --settings`) for a settings page with sliders for
+opacity, dwell and hide delays, hot-zone and panel width, the slide animation,
+a display picker, checkboxes for every section of the face, and the
+start-with-Windows and token-renewal switches. Save applies immediately.
+
+<p align="center">
+  <img src="docs/settings-page.png" width="480" alt="Settings page with sliders, display picker and checkboxes">
+</p>
+
+The same values live in `%APPDATA%\claude-usage-panel\settings.json`, created
+on first run. Hand edits are picked up within two seconds, no restart needed:
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -128,6 +138,9 @@ defaults and can be hand-edited (restart the panel to apply):
 | `retain_days` | 60 | Ignore transcripts older than this |
 | `run_at_login` | false | Registers the exe in `HKCU\...\Run` on next start |
 | `panel_width_px` | 340 | Panel width (logical px) |
+| `opacity` | 0.97 | Panel background opacity, 0.3 to 1.0 |
+| `show_credits`, `show_model_windows`, `show_today` | true | Rows on the collapsed face |
+| `show_breakdown`, `show_by_model`, `show_daily` | true | Sections of the expanded view |
 
 The log is at `%APPDATA%\claude-usage-panel\panel.log`.
 

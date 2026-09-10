@@ -29,8 +29,8 @@ pub struct BarRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewModel {
     pub bars: Vec<BarRow>,
-    pub today: String,
-    pub today_sub: String,
+    /// Headline and sub-line for today's local usage; `None` when hidden.
+    pub today: Option<(String, String)>,
     pub footer: String,
     pub footer_warn: bool,
     /// Expanded-only rows: (left, right). Empty left = section header in right.
@@ -47,7 +47,9 @@ impl ViewModel {
     pub fn height(&self) -> f32 {
         let mut h = PAD + 4.0;
         h += self.bars.len() as f32 * ROW_BAR;
-        h += 8.0 + ROW_TEXT * 2.0; // today + sub
+        if self.today.is_some() {
+            h += 8.0 + ROW_TEXT * 2.0;
+        }
         if self.expanded {
             h += 6.0 + self.detail.len() as f32 * ROW_TEXT;
         }
@@ -143,25 +145,29 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
     ];
     if let Some(r) = r {
         // Per-model weekly windows from the `limits` array (e.g. "Fable").
-        for l in r.limits.iter().filter(|l| l.kind == "weekly_scoped") {
-            let label = format!("Weekly {}", l.scope.as_deref().unwrap_or("model"));
-            let w = Window { used_percentage: l.percent, resets_at: l.resets_at };
-            bars.push(bar(&label, Some(&w), age, stale_after, now, false));
+        if settings.show_model_windows {
+            for l in r.limits.iter().filter(|l| l.kind == "weekly_scoped") {
+                let label = format!("Weekly {}", l.scope.as_deref().unwrap_or("model"));
+                let w = Window { used_percentage: l.percent, resets_at: l.resets_at };
+                bars.push(bar(&label, Some(&w), age, stale_after, now, false));
+            }
         }
         // Usage credits are real money, so they earn a place on the collapsed face.
-        if let Some(c) = r.credits.as_ref().filter(|c| c.enabled) {
-            let right = match c.limit_minor {
-                Some(lim) => format!("{} of {} this month", c.money(c.used_minor), c.money(lim)),
-                None => format!("{} this month", c.money(c.used_minor)),
-            };
-            bars.push(BarRow {
-                label: "Usage credits (billed)".into(),
-                right,
-                pct: Some(c.percent.clamp(0.0, 100.0)),
-                state: if stale { BarState::Stale } else { BarState::Fresh },
-            });
+        if settings.show_credits {
+            if let Some(c) = r.credits.as_ref().filter(|c| c.enabled) {
+                let right = match c.limit_minor {
+                    Some(lim) => format!("{} of {} this month", c.money(c.used_minor), c.money(lim)),
+                    None => format!("{} this month", c.money(c.used_minor)),
+                };
+                bars.push(BarRow {
+                    label: "Usage credits (billed)".into(),
+                    right,
+                    pct: Some(c.percent.clamp(0.0, 100.0)),
+                    state: if stale { BarState::Stale } else { BarState::Fresh },
+                });
+            }
         }
-        if expanded {
+        if expanded && settings.show_model_windows {
             for (label, w) in [
                 ("Weekly Opus", r.seven_day_opus.as_ref()),
                 ("Weekly Sonnet", r.seven_day_sonnet.as_ref()),
@@ -174,13 +180,18 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
         }
     }
 
-    let (today, today_sub) = if scan.loading {
+    let today = if !settings.show_today {
+        None
+    } else if scan.loading {
         let (d, t) = scan.progress;
-        ("Scanning transcripts...".to_string(), if t > 0 { format!("{d} / {t} files") } else { String::new() })
+        Some(("Scanning transcripts...".to_string(), if t > 0 { format!("{d} / {t} files") } else { String::new() }))
     } else if !scan.root_exists {
-        ("No Claude Code transcripts found".to_string(), String::new())
+        Some(("No Claude Code transcripts found".to_string(), String::new()))
     } else {
-        (format!("Today: {}", totals_line(&scan.today)), "Claude Code on this PC - list-price estimate, not billing".to_string())
+        Some((
+            format!("Today: {}", totals_line(&scan.today)),
+            "Claude Code on this PC - list-price estimate, not billing".to_string(),
+        ))
     };
 
     let (footer, footer_warn) = match (&limits.error, age) {
@@ -193,20 +204,20 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
     let mut detail = Vec::new();
     if expanded {
         if let Some(r) = r {
-            if !r.breakdown.is_empty() {
+            if settings.show_breakdown && !r.breakdown.is_empty() {
                 detail.push((String::new(), "Weekly window by surface".into()));
                 for b in r.breakdown.iter().filter(|b| b.percent > 0.0) {
                     detail.push((b.display_name.clone(), format!("{:.0}% of this week's use", b.percent)));
                 }
             }
         }
-        if !scan.by_model.is_empty() {
+        if settings.show_by_model && !scan.by_model.is_empty() {
             detail.push((String::new(), "By model - last 7 days".into()));
             for m in scan.by_model.iter().take(5) {
                 detail.push((m.model.clone(), totals_line(&m.totals)));
             }
         }
-        if !scan.daily.is_empty() {
+        if settings.show_daily && !scan.daily.is_empty() {
             detail.push((String::new(), "Last 7 days".into()));
             for d in &scan.daily {
                 detail.push((d.date.format("%a %d %b").to_string(), totals_line(&d.totals)));
@@ -215,7 +226,7 @@ pub fn build(scan: &ScanView, limits: &LimitsView, settings: &Settings, now: Dat
         detail.push((String::new(), "click to collapse - right-click for menu".into()));
     }
 
-    ViewModel { bars, today, today_sub, footer, footer_warn, detail, expanded }
+    ViewModel { bars, today, footer, footer_warn, detail, expanded }
 }
 
 #[cfg(test)]
@@ -277,11 +288,45 @@ mod tests {
         let now_i = Instant::now();
         let scan = ScanView { loading: true, progress: (3, 26), ..Default::default() };
         let vm = build(&scan, &LimitsView::default(), &Settings::default(), now, now_i, false);
-        assert_eq!(vm.today, "Scanning transcripts...");
-        assert_eq!(vm.today_sub, "3 / 26 files");
+        assert_eq!(vm.today.as_ref().unwrap().0, "Scanning transcripts...");
+        assert_eq!(vm.today.as_ref().unwrap().1, "3 / 26 files");
         let collapsed = vm.height();
         let vm2 = build(&scan, &LimitsView::default(), &Settings::default(), now, now_i, true);
         assert!(vm2.height() > collapsed);
+    }
+
+    #[test]
+    fn show_flags_hide_sections() {
+        let now = Utc::now();
+        let now_i = Instant::now();
+        let mut r = reading(now);
+        r.limits.push(usage_core::limits::LimitEntry {
+            kind: "weekly_scoped".into(),
+            group: "weekly".into(),
+            percent: 20.0,
+            severity: "normal".into(),
+            resets_at: Some(now + chrono::Duration::days(3)),
+            scope: Some("Fable".into()),
+            is_active: false,
+        });
+        r.credits = Some(usage_core::limits::Credits {
+            enabled: true,
+            used_minor: 9503,
+            limit_minor: Some(11000),
+            currency: "BRL".into(),
+            exponent: 2,
+            percent: 86.4,
+            limit_reached: false,
+        });
+        let limits = LimitsView { reading: Some(r), last_success: Some(now_i), ..Default::default() };
+        let all = build(&ScanView::default(), &limits, &Settings::default(), now, now_i, false);
+        assert_eq!(all.bars.len(), 4, "session, weekly, Fable, credits");
+        assert_eq!(all.bars[3].right, "R$95.03 of R$110.00 this month");
+        let s = Settings { show_credits: false, show_model_windows: false, show_today: false, ..Default::default() };
+        let few = build(&ScanView::default(), &limits, &s, now, now_i, false);
+        assert_eq!(few.bars.len(), 2);
+        assert!(few.today.is_none());
+        assert!(few.height() < all.height());
     }
 
     #[test]

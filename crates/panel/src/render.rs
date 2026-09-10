@@ -189,7 +189,7 @@ impl Renderer {
 
     /// Draw the panel: body occupies `[margin, margin + panel_w] x [0, panel_h]`,
     /// with a soft shadow in the margin around it.
-    pub fn draw(&mut self, frame: &Frame, scale: f32, margin: i32, panel_w: i32, panel_h: i32, vm: &ViewModel) -> Result<()> {
+    pub fn draw(&mut self, frame: &Frame, scale: f32, margin: i32, panel_w: i32, panel_h: i32, opacity: f32, vm: &ViewModel) -> Result<()> {
         self.fonts(scale)?;
         let (w, h) = (frame.width, frame.height);
         unsafe {
@@ -212,9 +212,10 @@ impl Renderer {
         }
 
         // Body with rounded bottom corners only.
+        let bg = D2D1_COLOR_F { a: opacity.clamp(0.3, 1.0), ..BG };
         let body = D2D_RECT_F { left: m, top: 0.0, right: m + pw, bottom: ph };
-        self.fill_rr(body, radius, BG);
-        self.fill(D2D_RECT_F { left: m, top: 0.0, right: m + pw, bottom: radius }, BG);
+        self.fill_rr(body, radius, bg);
+        self.fill(D2D_RECT_F { left: m, top: 0.0, right: m + pw, bottom: radius }, bg);
         // Hairline highlight at the bottom edge for depth.
         self.fill_rr(D2D_RECT_F { left: m + 1.0, top: ph - 2.0 * scale, right: m + pw - 1.0, bottom: ph }, radius, rgba(255, 255, 255, 0.06));
 
@@ -255,12 +256,14 @@ impl Renderer {
             y += ROW_BAR * scale;
         }
 
-        y += 8.0 * scale;
         let rt_h = ROW_TEXT * scale;
-        self.text(&vm.today, &fonts.body, D2D_RECT_F { left: x0, top: y, right: x1, bottom: y + rt_h }, TEXT);
-        y += rt_h;
-        self.text(&vm.today_sub, &fonts.small, D2D_RECT_F { left: x0, top: y, right: x1, bottom: y + rt_h }, MUTED);
-        y += rt_h;
+        if let Some((head, sub)) = &vm.today {
+            y += 8.0 * scale;
+            self.text(head, &fonts.body, D2D_RECT_F { left: x0, top: y, right: x1, bottom: y + rt_h }, TEXT);
+            y += rt_h;
+            self.text(sub, &fonts.small, D2D_RECT_F { left: x0, top: y, right: x1, bottom: y + rt_h }, MUTED);
+            y += rt_h;
+        }
 
         if vm.expanded {
             y += 6.0 * scale;
