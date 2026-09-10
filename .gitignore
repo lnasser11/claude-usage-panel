@@ -1,2 +1,22 @@
-/target
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Local scratch and screenshots
 *.tmp
+*.log
+/shots/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Never commit local panel config or Claude credentials
+settings.json
+.credentials.json
+usage-snapshot.json
+*.token
